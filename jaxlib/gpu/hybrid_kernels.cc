@@ -36,6 +36,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "hybrid_kernels.h"
 #include "jaxlib/cpu/lapack_kernels.h"
 #include "jaxlib/ffi_helpers.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
@@ -102,6 +103,27 @@ struct MagmaGeev<ffi::C64> {
 template <>
 struct MagmaGeev<ffi::C128> {
   static constexpr char name[] = "magma_zgeev";
+};
+
+template <ffi::DataType DataType>
+struct MagmaGeqp3Gpu {
+  static_assert(always_false<DataType>::value, "unsupported data type");
+};
+template <>
+struct MagmaGeqp3Gpu<ffi::F32> {
+  static constexpr char name[] = "magma_sgeqp3_gpu";
+};
+template <>
+struct MagmaGeqp3Gpu<ffi::F64> {
+  static constexpr char name[] = "magma_dgeqp3_gpu";
+};
+template <>
+struct MagmaGeqp3Gpu<ffi::C64> {
+  static constexpr char name[] = "magma_cgeqp3_gpu";
+};
+template <>
+struct MagmaGeqp3Gpu<ffi::C128> {
+  static constexpr char name[] = "magma_zgeqp3_gpu";
 };
 
 MagmaLookup::~MagmaLookup() {
@@ -204,6 +226,168 @@ absl::StatusOr<void*> FindMagmaSymbol(const char name[]) {
   }
   return lookup.Find(name);
 }
+
+//== Column Pivoting QR Factorization ==//
+
+// magma geqp3_gpu
+// Only real valued at first
+template <ffi::DataType DataType>
+class PivotingQrFactorizationHost {
+  using Real = ffi::NativeType<DataType>;
+
+  public:
+    explicit PivotingQrFactorizationHost() = default;
+    PivotingQrFactorizationHost(PivotingQrFactorizationHost&&) = default;
+
+    absl::StatusOr<int> lwork(int m, int n) {
+      int64_t lwork = PivotingQrFactorization<DataType>::GetWorkspaceSize(m, n);
+      return MaybeCastNoOverflow<int>(lwork);
+    }
+
+    void compute(int m, int n, Real* dA, int ldda, int* jpvt, Real* tau, Real* dwork,
+                 int lwork, int* info) {
+      PivotingQrFactorization<DataType>::fn(m, n, dA, ldda, jpvt, tau, dwork,
+                                            lwork, info);
+    }
+};
+
+
+template <ffi::DataType DataType>
+class PivotingQrFactorizationMagma {
+  using Real = ffi::NativeType<DataType>;
+  using Fn = int(int, int, Real*, int, int*, Real*, Real*, int, int*);
+
+  public:
+    explicit PivotingQrFactorizationMagma() = default;
+    PivotingQrFactorizationMagma(PivotingQrFactorizationMagma&&) = default;
+
+    absl::StatusOr<int> lwork(int m, int n) {
+      // `{s,d}geqp3_gpu` does not support a workspace query but we can still assign the symbol here.
+      auto maybe_ptr = FindMagmaSymbol(MagmaGeqp3Gpu<DataType>::name);
+      if (!maybe_ptr.ok()) return maybe_ptr.status();
+      fn_ = reinterpret_cast<Fn*>(*maybe_ptr);
+      // We guess the optimal block_size for now.
+      int optimal_block_size = 32;
+      return (n+1) * optimal_block_size + 2 * n;
+    }
+
+    void compute(int m, int n, Real* dA, int ldda, int* jpvt, Real* tau, Real* dwork,
+                 int lwork, int* info) {
+      fn_(m, n, dA, ldda, jpvt, tau, dwork, lwork, info);
+    }
+  private:
+    Fn* fn_ = nullptr;
+};
+
+
+template<ffi::DataType DataType, typename Impl>
+ffi::Error PivotingQRFactorizationReal(Impl impl, int64_t batch, int64_t rows,
+                                       int64_t cols, gpuStream_t stream,
+                                       ffi::AnyBuffer x,
+                                       ffi::AnyBuffer jpvt,
+                                       ffi::Result<ffi::AnyBuffer> x_out,
+                                       ffi::Result<ffi::AnyBuffer> jpvt_out,
+                                       ffi::Result<ffi::AnyBuffer> tau,
+                                       ffi::Result<ffi::Buffer<ffi::S32>> info) {
+
+  FFI_ASSIGN_OR_RETURN(auto m, MaybeCastNoOverflow<int>(rows));
+  FFI_ASSIGN_OR_RETURN(auto n, MaybeCastNoOverflow<int>(cols));
+  auto min_dim = std::min(m,n);
+
+  auto x_host = HostBuffer<Real>(x.element_count());
+  FFI_RETURN_IF_ERROR_STATUS(
+      x_host.CopyFromDevice(stream, x.typed_data<DataType>));
+  auto jpvt_host = HostBuffer<int>(jpvt.element_count());
+  FFI_RETURN_IF_ERROR_STATUS(
+      jpvt_host.CopyFromDevice(stream, jpvt.typed_data<int>));
+  auto tau_host = HostBuffer<Real>(batch * min_dim);
+  auto work_host = AllocateScratchMemory<DataType>(lwork);
+  FFI_ASSIGN_OR_RETURN(int lwork, impl.lwork(m, n));
+  auto info_host = HostBuffer<int>(batch);
+
+  FFI_RETURN_IF_ERROR_STATUS(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
+  // MAGMA does not provide a batched geqp3 routine, so perform batching manually.
+  for (int64_t i=0; i < batch_count; ++i) {
+    impl.compute(m, n, x_host.get() + i * (m*n), m, jpvt_host.get() + i * n, tau_host.get() + i * min_dim,
+      work_host.get(), lwork, info_host.get() + i);
+  }
+  FFI_RETURN_IF_ERROR_STATUS(
+      x_host.CopyToDevice(stream, x_out->typed_data<DataType>()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      jpvt_host.CopyToDevice(stream, jpvt_out->typed_data<int>()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      tau_host.CopyToDevice(stream, tau->typed_data<DataType>()));
+  FFI_RETURN_IF_ERROR_STATUS(
+      info_host.CopyToDevice(stream, info->typed_data()));
+  FFI_RETURN_IF_ERROR_STATUS(JAX_AS_STATUS(gpuStreamSynchronize(stream)));
+  return ffi::Error::Success();
+}
+
+
+ffi::Error PivotingQrFactorizationRealDispatch(gpuStream_t stream, std::string_view magma,
+                                               ffi::AnyBuffer x,
+                                               ffi::AnyBuffer jpvt,
+                                               ffi::Result<ffi::AnyBuffer> x_out,
+                                               ffi::Result<ffi::AnyBuffer> jpvt_out,
+                                               ffi::Result<ffi::AnyBuffer> tau,
+                                               ffi::Result<ffi::Buffer<ffi::S32>> info) {
+  auto dataType = x.element_type();
+  if (dataType != x_out->element_type() || dataType != tau->element_type()) {
+    return ffi::Error::InvalidArgument(
+      "The buffers 'x', 'x_out' and 'tau' must have the same element type.");
+  }
+  FFI_ASSIGN_OR_RETURN((auto [batch, rows, cols]),
+                      SplitBatch2D(x.dimensions()));
+  FFI_RETURN_IF_ERROR(CheckShape(jpvt->dimensions(), {batch, rows}, "jpvt_out", "geqp3"));
+  FFI_RETURN_IF_ERROR(CheckShape(x_out->dimensions(), {batch, rows, cols}, "x_out", "geqp3"));
+  FFI_RETURN_IF_ERROR(CheckShape(jpvt_out->dimensions(), {batch, rows}, "jpvt_out", "geqp3"));
+  FFI_RETURN_IF_ERROR(CheckShape(tau->dimensions(), {batch, std::min(rows, cols)}, "tau", "geqp3"));
+  FFI_RETURN_IF_ERROR(CheckShape(info->dimensions(), batch, "info", "geqp3"));
+
+  bool use_magma = magma == "on";
+  if (magma == "auto" && cols >= 2048) {
+    use_magma = FindMagmaSymbol("magma_init").ok();
+  }
+
+  switch (dataType) {
+    case ffi::F32:
+      if (use_magma) {
+        return PivotingQRFactorizationReal<ffi::F32>(PivotingQrFactorizationMagma<ffi::F32>(),
+                                                    batch, rows, cols, stream, x, jpvt, x_out,
+                                                    jpvt_out, tau, info);
+      } else {
+        return PivotingQRFactorizationReal<ffi::F32>(PivotingQrFactorizationHost<ffi::F32>(),
+                                                    batch, rows, cols, stream, x, jpvt, x_out,
+                                                    jpvt_out, tau, info);
+      }
+    case ffi::F64:
+      if (use_magma) {
+          return PivotingQRFactorizationReal<ffi::F64>(PivotingQrFactorizationMagma<ffi::F64>(),
+                                                      batch, rows, cols, stream, x, jpvt, x_out,
+                                                      jpvt_out, tau, info);
+        } else {
+          return PivotingQRFactorizationReal<ffi::F64>(PivotingQrFactorizationHost<ffi::F64>(),
+                                                      batch, rows, cols, stream, x, jpvt, x_out,
+                                                      jpvt_out, tau, info);
+        }
+    default:
+      return ffi::Error::InvalidArgument(absl::StrFormat(
+          "Unsupported dtype %s in geqp3", absl::FormatStreamed(dataType)));
+  }
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(PivotingQrReal, PivotingQrFactorizationRealDispatch,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<gpuStream_t>>()
+                                  .Attr<std::string_view>("magma")
+                                  .Arg<ffi::AnyBuffer>()        // x
+                                  .Arg<ffi::AnyBuffer>()        // jpvt
+                                  .Ret<ffi::AnyBuffer>()        // x_out
+                                  .Ret<ffi::AnyBuffer>()        // jpvt_out
+                                  .Ret<ffi::AnyBuffer>()        // tau
+                                  .Ret<ffi::Buffer<ffi::S32>>() // info
+);
+
 
 // Real-valued eigendecomposition
 

@@ -312,21 +312,23 @@ def lu(x: ArrayLike) -> tuple[Array, Array, Array]:
 
 @overload
 def qr(x: ArrayLike, *, pivoting: Literal[False], full_matrices: bool = True,
-      ) -> tuple[Array, Array]:
+       use_magma: bool | None = None) -> tuple[Array, Array]:
   ...
 
 @overload
 def qr(x: ArrayLike, *, pivoting: Literal[True], full_matrices: bool = True,
-      ) -> tuple[Array, Array, Array]:
+       use_magma: bool | None = None) -> tuple[Array, Array, Array]:
   ...
 
 @overload
 def qr(x: ArrayLike, *, pivoting: bool = False, full_matrices: bool = True,
-      ) -> tuple[Array, Array] | tuple[Array, Array, Array]:
+       use_magma: bool | None = None
+       ) -> tuple[Array, Array] | tuple[Array, Array, Array]:
   ...
 
 def qr(x: ArrayLike, *, pivoting: bool = False, full_matrices: bool = True,
-      ) -> tuple[Array, Array] | tuple[Array, Array, Array]:
+       use_magma: bool | None = None
+       ) -> tuple[Array, Array] | tuple[Array, Array, Array]:
   """QR decomposition.
 
   Computes the QR decomposition
@@ -359,7 +361,8 @@ def qr(x: ArrayLike, *, pivoting: bool = False, full_matrices: bool = True,
 
     Array ``p`` is an index vector with shape [..., n]
   """
-  q, r, *p = qr_p.bind(x, pivoting=pivoting, full_matrices=full_matrices)
+  q, r, *p = qr_p.bind(x, pivoting=pivoting, full_matrices=full_matrices,
+                       use_magma=use_magma)
   if pivoting:
     return q, r, p[0]
   return q, r
@@ -1870,22 +1873,27 @@ mlir.register_lowering(
     platform='rocm')
 
 
-def geqp3(a: ArrayLike, jpvt: ArrayLike) -> tuple[Array, Array, Array]:
+def geqp3(a: ArrayLike, jpvt: ArrayLike, *, use_magma: bool = False) -> tuple[Array, Array, Array]:
   """Computes the column-pivoted QR decomposition of a matrix.
 
   Args:
     a: a ``[..., m, n]`` batch of matrices, with floating-point or complex type.
     jpvt: a ``[..., n]`` batch of column-pivot index vectors with integer type,
+    use_magma: Locally override the ``jax_use_magma`` flag. If ``True``, the
+      `geqp3` is computed using MAGMA. If ``False``, the computation is done using
+      LAPACK on to the host CPU. If ``None`` (default), the behavior is controlled
+      by the ``jax_use_magma`` flag. This argument is only used on GPU.
   Returns:
     A ``(a, jpvt, taus)`` triple, where ``r`` is in the upper triangle of ``a``,
     ``q`` is represented in the lower triangle of ``a`` and in ``taus`` as
     elementary Householder reflectors, and ``jpvt`` is the column-pivot indices
     such that ``a[:, jpvt] = q @ r``.
   """
-  a_out, jpvt_out, taus = geqp3_p.bind(a, jpvt)
+  a_out, jpvt_out, taus = geqp3_p.bind(a, jpvt, use_magma=use_magma)
   return a_out, jpvt_out, taus
 
-def _geqp3_abstract_eval(a, jpvt):
+def _geqp3_abstract_eval(a, jpvt, *, use_magma):
+  del use_magma
   if not isinstance(a, ShapedArray) or not isinstance(jpvt, ShapedArray):
     raise NotImplementedError("Unsupported aval in geqp3_abstract_eval: "
                               f"{a.aval}, {jpvt.aval}")
@@ -1898,14 +1906,15 @@ def _geqp3_abstract_eval(a, jpvt):
   taus = a.update(shape=(*batch_dims, core.min_dim(m, n)))
   return a, jpvt, taus
 
-def _geqp3_batching_rule(batched_args, batch_dims):
+def _geqp3_batching_rule(batched_args, batch_dims, *, use_magma):
   a, jpvt = batched_args
   b_a, b_jpvt = batch_dims
   a = batching.moveaxis(a, b_a, 0)
   jpvt = batching.moveaxis(jpvt, b_jpvt, 0)
-  return geqp3(a, jpvt), (0, 0, 0)
+  return geqp3_p.bind(a, jpvt, use_magma=use_magma), (0, 0, 0)
 
-def _geqp3_cpu_lowering(ctx, a, jpvt):
+def _geqp3_cpu_lowering(ctx, a, jpvt, *, use_magma):
+  del use_magma  # unused
   a_aval, jpvt_aval = ctx.avals_in
   batch_dims = a_aval.shape[:-2]
   nb = len(batch_dims)
@@ -1917,13 +1926,42 @@ def _geqp3_cpu_lowering(ctx, a, jpvt):
                           # operand_output_aliases={0: 0})
   return rule(ctx, a, jpvt)
 
+def _geqp3_gpu_lowering(target_name_prefix, ctx, a, jpvt, *, use_magma):
+  a_aval, jpvt_aval = ctx.avals_in
+  batch_dims = a_aval.shape[:-2]
+  nb = len(batch_dims)
+  layout = [(nb, nb + 1) + tuple(range(nb - 1, -1, -1)), tuple(range(nb, -1, -1))]
+  result_layouts = layout + [tuple(range(nb, -1, -1))]
 
-geqp3_p = Primitive('geqp3')
+  gpu_solver.initialize_hybrid_kernels()
+  magma = config.gpu_use_magma.value
+  dtype_prefix = lapack.LAPACK_DTYPE_PREFIX[a.dtype]
+  target_name = f"{target_name_prefix}_hybrid_geqp3_real"
+
+  if use_magma is not None:
+    magma = "on" if use_magma else "off"
+
+  if magma == "off":
+    raise NotImplementedError("Pivoted QR on the GPU is only implemented via MAGMA.")
+  rule = ffi.ffi_lowering(
+    target_name, operand_layouts=layout, result_layouts=result_layouts
+  )
+  a_out, jpvt_out, tau, info = rule(a, jpvt, magma=magma)
+  return a_out, jpvt_out, tau
+
+
+geqp3_p = Primitive("geqp3")
 geqp3_p.multiple_results = True
 geqp3_p.def_impl(partial(dispatch.apply_primitive, geqp3_p))
 geqp3_p.def_abstract_eval(_geqp3_abstract_eval)
 batching.primitive_batchers[geqp3_p] = _geqp3_batching_rule
 mlir.register_lowering(geqp3_p, _geqp3_cpu_lowering, platform="cpu")
+mlir.register_lowering(
+  geqp3_p, partial(_geqp3_gpu_lowering, target_name_prefix="cu"), platform="cuda"
+)
+mlir.register_lowering(
+  geqp3_p, partial(_geqp3_gpu_lowering, target_name_prefix="hip"), platform="rocm"
+)
 
 # householder_product: product of elementary Householder reflectors
 
@@ -2017,13 +2055,14 @@ mlir.register_lowering(
     platform='rocm')
 
 
-def _qr_impl(operand, *, pivoting, full_matrices):
+def _qr_impl(operand, *, pivoting, full_matrices, use_magma):
   q, r, *p = dispatch.apply_primitive(qr_p, operand, pivoting=pivoting,
-                                      full_matrices=full_matrices)
+                                      full_matrices=full_matrices, use_magma=use_magma)
   return (q, r, p[0]) if pivoting else (q, r)
 
 # TODO: determine if dtype updating is needed.
-def _qr_abstract_eval(operand, *, pivoting, full_matrices):
+def _qr_abstract_eval(operand, *, pivoting, full_matrices, use_magma):
+  del use_magma
   if isinstance(operand, ShapedArray):
     if operand.ndim < 2:
       raise ValueError("Argument to QR decomposition must have ndims >= 2")
@@ -2038,13 +2077,13 @@ def _qr_abstract_eval(operand, *, pivoting, full_matrices):
     p = operand.update(dtyp=np.dtype(np.int32))
   return (q, r, p) if pivoting else (q, r)
 
-def qr_jvp_rule(primals, tangents, *, pivoting, full_matrices):
+def qr_jvp_rule(primals, tangents, *, pivoting, full_matrices, use_magma):
   # See j-towns.github.io/papers/qr-derivative.pdf for a terse derivation.
   x, = primals
   dx, = tangents
-  q, r, *p = qr_p.bind(x, pivoting=pivoting, full_matrices=False)
+  q, r, *p = qr_p.bind(x, pivoting=pivoting, full_matrices=False, use_magma=use_magma)
   *_, m, n = x.shape
-  if m < n or (full_matrices and m != n):
+  if m < n or (full_matrices and m != n) or pivoting:
     raise NotImplementedError(
       "Unimplemented case of QR decomposition derivative")
   dx_rinv = triangular_solve(r, dx)  # Right side solve by default
@@ -2061,14 +2100,15 @@ def qr_jvp_rule(primals, tangents, *, pivoting, full_matrices):
     return (q, r, p), (dq, dr, dp)
   return (q, r), (dq, dr)
 
-def _qr_batching_rule(batched_args, batch_dims, *, pivoting, full_matrices):
+def _qr_batching_rule(batched_args, batch_dims, *, pivoting, full_matrices, use_magma):
   x, = batched_args
   bd, = batch_dims
   x = batching.moveaxis(x, bd, 0)
   out_axes = (0, 0, 0) if pivoting else (0, 0)
-  return qr_p.bind(x, pivoting=pivoting, full_matrices=full_matrices), out_axes
+  return (qr_p.bind(x, pivoting=pivoting, full_matrices=full_matrices,
+                    use_magma=use_magma), out_axes)
 
-def _qr_lowering(a, *, pivoting, full_matrices):
+def _qr_lowering(a, *, pivoting, full_matrices, use_magma):
   *batch_dims, m, n = a.shape
   if m == 0 or n == 0:
     k = m if full_matrices else core.min_dim(m, n)
@@ -2083,7 +2123,7 @@ def _qr_lowering(a, *, pivoting, full_matrices):
 
   if pivoting:
     jpvt = lax.full((*batch_dims, n), 0, dtype=np.dtype(np.int32))
-    r, p, taus = geqp3(a, jpvt)
+    r, p, taus = geqp3(a, jpvt, use_magma=use_magma)
     p -= 1  # Convert geqp3's 1-based indices to 0-based indices by subtracting 1.
   else:
     r, taus = geqrf(a)

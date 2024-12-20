@@ -48,6 +48,8 @@ class MagmaLookup {
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(kEigReal);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(kEigComp);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(PivotingQrReal);
+// XLA_FFI_DECLARE_HANDLER_SYMBOL(PivotingQrComp);
 
 }  // namespace JAX_GPU_NAMESPACE
 }  // namespace jax
