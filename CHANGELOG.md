@@ -21,6 +21,9 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     decorator to support customizing the behavior of opaque functions under
     JAX-level dead code elimination (DCE). See {jax-issue}`#25956` for more
     details.
+  * {func}`jax.lax.linalg.qr`, and {func}`jax.scipy.linalg.qr`, now support
+    column-pivoting on CPU and GPU. See {jax-issue}`#20282` and
+    {jax-issue}`#25955` for more details.
 
 ## jax 0.5.0 (Jan 17, 2025)
 
